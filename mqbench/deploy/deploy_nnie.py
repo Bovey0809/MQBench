@@ -61,33 +61,67 @@ class NNIE_process(object):
 
         nodes_to_be_removed = []
         clip_ranges = {}
+        processed_outputs = set()  # 用于跟踪已处理的输出
+        processed_nodes = set()    # 用于跟踪节点索引而不是节点本身
+
         for node in graph.node:
             if node.op_type == 'QuantizeLinear':
-                dequant_node = inp2node[node.output[0]][0][0]
-                next_nodes = inp2node[dequant_node.output[0]]
-                if len(next_nodes) == 1 and next_nodes[0][1] == 1 and next_nodes[0][0].op_type in ['Gemm', 'Conv']:
-                    # fake quantize for weights
-                    next_node, idx = next_nodes[0]
-                    next_node.input[idx] = node.input[0]
-                    # clip weights
-                    tensor_name = node.input[0]
-                    data = name2data[tensor_name]
-                    clip_range = name2data[dequant_node.input[0]]
-                    new_data = np.clip(data, -clip_range, clip_range)
-                    new_data = numpy_helper.from_array(new_data)
-                    named_initializer[tensor_name].raw_data = new_data.raw_data
-                    logger.info(f'Clip weights {tensor_name} to range [{-clip_range}, {clip_range}].')
-                else:
-                    # fake quantize for activations
-                    clip_ranges[node.input[0]] = name2data[dequant_node.input[0]]
+                # 获取量化节点的所有输出连接
+                quant_outputs = node.output
+                for quant_output in quant_outputs:
+                    if quant_output in processed_outputs:
+                        continue
+                    
+                    next_nodes = inp2node[quant_output]
+                    # 获取原始输入
+                    original_input = node.input[0]
+                    # 记录clip range
+                    clip_ranges[original_input] = name2data[node.input[1]]
+
+                    # 处理所有使用这个输出的节点
                     for next_node, idx in next_nodes:
-                        next_node.input[idx] = node.input[0]
+                        if next_node.op_type == 'Cast':
+                            # 如果是Cast节点，需要处理Cast节点的所有输出连接
+                            cast_outputs = next_node.output
+                            for cast_output in cast_outputs:
+                                if cast_output in processed_outputs:
+                                    continue
+                                
+                                cast_next_nodes = inp2node[cast_output]
+                                # 将所有使用Cast输出的节点重新连接到原始输入
+                                for cast_next_node, cast_next_idx in cast_next_nodes:
+                                    cast_next_node.input[cast_next_idx] = original_input
+                                processed_outputs.add(cast_output)
+                            
+                            # 将Cast节点加入待删除列表（使用节点名称作为标识）
+                            node_name = next_node.name if hasattr(next_node, 'name') else str(id(next_node))
+                            if node_name not in processed_nodes:
+                                nodes_to_be_removed.append(next_node)
+                                processed_nodes.add(node_name)
+                        else:
+                            # 直接连接到原始输入
+                            next_node.input[idx] = original_input
+                    
+                    processed_outputs.add(quant_output)
+                
+                # 将量化节点及其常量输入加入待删除列表
+                node_name = node.name if hasattr(node, 'name') else str(id(node))
+                if node_name not in processed_nodes:
+                    nodes_to_be_removed.append(node)
+                    processed_nodes.add(node_name)
+                    
+                    # 添加常量输入节点
+                    constant_inputs = get_constant_inputs(node, out2node)
+                    for const_node in constant_inputs:
+                        const_name = const_node.name if hasattr(const_node, 'name') else str(id(const_node))
+                        if const_name not in processed_nodes:
+                            nodes_to_be_removed.append(const_node)
+                            processed_nodes.add(const_name)
 
-                nodes_to_be_removed.append(node)
-                nodes_to_be_removed.extend(get_constant_inputs(node, out2node))
-
+        # 删除所有标记的节点（保持原始顺序）
         for node in nodes_to_be_removed:
-            graph.node.remove(node)
+            if node in graph.node:
+                graph.node.remove(node)
 
         gfpq_param_dict = self.gen_gfpq_param_file(graph, clip_ranges)
 
